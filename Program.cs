@@ -1,6 +1,15 @@
-using iTextSharp.text.pdf;
-using Microsoft.Extensions.Options;
 
+using iText.Kernel.Pdf;
+using iText.Kernel.Utils;
+using Microsoft.Extensions.Options;
+using iText.Kernel.Pdf;
+using iText.Kernel.Pdf.Xobject;
+using iText.Kernel.Utils;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Processing;
+using SixLabors.ImageSharp.Formats.Jpeg;
+using Ghostscript.NET;
+using Ghostscript.NET.Processor;
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
@@ -49,85 +58,146 @@ app.MapGet("/test", () => "PDF service is working!");
 // The compression is done using iTextSharp library.
 app.MapPost("/compress-pdf", async (IFormFile file, IOptions<PdfSettings> settings) =>
 {
-    // Validate the file size and type
     var pdfSettings = settings.Value;
-    if (file == null || file.Length == 0)
-        return Results.BadRequest("No file uploaded.");
 
-    // Check if the file size exceeds the maximum allowed size
-    var maxSizeInBytes = pdfSettings.MaxFileSizeInMB * 1024 * 1024;
-    if (file.Length > maxSizeInBytes)
-        return Results.BadRequest($"File size exceeds the maximum limit of {pdfSettings.MaxFileSizeInMB} MB.");
-    // Check if the file size is below the minimum allowed size
-    var minSizeInBytes = pdfSettings.MinFileSizeInMB * 1024 * 1024;
-    if (file.Length < minSizeInBytes)
-        return Results.BadRequest($"File size is below the minimum limit of {pdfSettings.MinFileSizeInMB} MB.");
-    // Check if the file type is allowed
-    var allowedExtensions = pdfSettings.AllowedExtensions;
-    var fileExtension = Path.GetExtension(file.FileName).ToLowerInvariant();
-    if (!allowedExtensions.Contains(fileExtension))
-        return Results.BadRequest($"File type '{fileExtension}' is not allowed. Allowed types: {string.Join(", ", allowedExtensions)}.");
-        
+    if (!IsValidFile(file, pdfSettings, out var validationError))
+        return Results.BadRequest(validationError);
 
-    if (file.ContentType != "application/pdf")
-        return Results.BadRequest("Only PDF files are allowed.");
     try
     {
         using var inputStream = file.OpenReadStream();
-        using var outputStream = new MemoryStream();
+        var compressedBytes = CompressPdfWithGhostscript(inputStream, "screen");
 
-        using (var reader = new iTextSharp.text.pdf.PdfReader(inputStream))
-        using (var stamper = new iTextSharp.text.pdf.PdfStamper(reader, outputStream))
-        {
-            stamper.SetFullCompression();
+        var compressionRatio = Math.Round((1.0 - (double)compressedBytes.Length / file.Length) * 100, 2);
+        Console.WriteLine($"Original: {file.Length} bytes, Compressed: {compressedBytes.Length} bytes, Saved: {compressionRatio}%");
 
-            for (int i = 1; i <= reader.NumberOfPages; i++)
-            {
-                reader.RemoveUnusedObjects();
-            }
-        }
-        var compressedBytes = outputStream.ToArray(); 
-        return Results.File(compressedBytes, "application/pdf",$"compressed_{file.FileName}");
+        return Results.File(compressedBytes, "application/pdf", $"compressed_{file.FileName}");
     }
     catch (Exception ex)
-        {
-        return Results.Problem($"An error occurred while compressing the PDF: {ex.Message}");
+    {
+        Console.WriteLine($"Compression error: {ex.Message}");
+        return Results.Problem($"Error: {ex.Message}");
     }
 
-    //return Results.Ok(new
-    //{
-    //    Message = "PDF file recieved, compression will be impremeted next",
-    //    FileName =file.FileName,
-    //    Size = file.Length,
-    //    ContentType = file.ContentType
-    //});
-})
-    .WithName("CompressPdf")
-    .DisableAntiforgery();
-
-app.MapPost("/upload", async (IFormFile file) =>
-{
-    if (file == null || file.Length == 0)
-        return Results.BadRequest("No file uploaded.");
-    //REading the file content
-    using var stream = file.OpenReadStream();
-    using var memoryStream = new MemoryStream();
-    await stream.CopyToAsync(memoryStream);
-
-    var fileBytes = memoryStream.ToArray();
-
-    return Results.Ok(new
+    static bool IsValidFile(IFormFile file, PdfSettings settings, out string error)
     {
-        FileName = file.FileName,
-        Size = file.Length,
-        ContentType = file.ContentType,
-        FirstBytes = Convert.ToHexString(fileBytes.Take(10).ToArray())
-    });
+        error = "";
 
+        if (file == null || file.Length == 0)
+        {
+            error = "No file uploaded.";
+            return false;
+        }
+
+        var ext = Path.GetExtension(file.FileName).ToLowerInvariant();
+        var maxSize = settings.MaxFileSizeInMB * 1024 * 1024;
+        var minSize = settings.MinFileSizeInMB * 1024 * 1024;
+
+        if (file.Length > maxSize)
+        {
+            error = $"File size exceeds the maximum of {settings.MaxFileSizeInMB} MB.";
+            return false;
+        }
+
+        if (file.Length < minSize)
+        {
+            error = $"File size is below the minimum of {settings.MinFileSizeInMB} MB.";
+            return false;
+        }
+
+        if (!settings.AllowedExtensions.Contains(ext))
+        {
+            error = $"File extension '{ext}' is not allowed.";
+            return false;
+        }
+
+        if (file.ContentType != "application/pdf")
+        {
+            error = "Only PDF files are allowed.";
+            return false;
+        }
+
+        return true;
+    }
+
+    static byte[] CompressPdfWithGhostscript(Stream inputStream, string pdfSetting)
+    {
+        var tempInputPath = Path.GetTempFileName() + ".pdf";
+        var tempOutputPath = Path.GetTempFileName() + "_compressed.pdf";
+
+        try
+        {
+            // Save input stream to temp file
+            using (var fileStream = File.Create(tempInputPath))
+                inputStream.CopyTo(fileStream);
+
+            var gsVersion = GhostscriptVersionInfo.GetLastInstalledVersion(
+                GhostscriptLicense.GPL | GhostscriptLicense.AFPL,
+                GhostscriptLicense.GPL
+            );
+
+            using var processor = new GhostscriptProcessor(gsVersion, true);
+
+            var switches = new[]
+            {
+                "-q",
+                "-dNOPAUSE",
+                "-dBATCH",
+                "-dSAFER",
+                "-sDEVICE=pdfwrite",
+                "-dCompatibilityLevel=1.4",
+                $"-dPDFSETTINGS=/{pdfSetting}", // e.g. screen, ebook, printer
+                $"-sOutputFile={tempOutputPath}",
+                tempInputPath
+            };
+
+            processor.StartProcessing(switches, null);
+
+            return File.ReadAllBytes(tempOutputPath);
+        }
+        finally
+        {
+            if (File.Exists(tempInputPath)) File.Delete(tempInputPath);
+            if (File.Exists(tempOutputPath)) File.Delete(tempOutputPath);
+        }
+    }
 })
-
-.WithName("getFileUpload")
+.WithName("CompressPdf")
 .DisableAntiforgery();
+
+static byte[] CompressImage(byte[] imageBytes, int targetDPI)
+{
+    try
+    {
+        using var inputStream = new MemoryStream(imageBytes);
+        using var image = SixLabors.ImageSharp.Image.Load(inputStream);
+        using var outputStream = new MemoryStream();
+        
+        Console.WriteLine($"Original image: {image.Width}x{image.Height}");
+        
+        // Снижаем разрешение
+        var scale = Math.Min(1.0, targetDPI / 300.0);
+        if (scale < 1.0)
+        {
+            var newWidth = (int)(image.Width * scale);
+            var newHeight = (int)(image.Height * scale);
+            image.Mutate(x => x.Resize(newWidth, newHeight));
+            Console.WriteLine($"Resized to: {newWidth}x{newHeight}");
+        }
+        
+        // Сильное JPEG сжатие
+        var encoder = new SixLabors.ImageSharp.Formats.Jpeg.JpegEncoder { Quality = 50 };
+        image.Save(outputStream, encoder);
+        
+        return outputStream.ToArray();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error compressing image: {ex.Message}");
+        return imageBytes;
+    }
+}
+
 
 app.Run();
 
